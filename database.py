@@ -132,22 +132,24 @@ class Table(DatabaseInterface):
         command = f'''INSERT INTO {self.name} {self._columns} VALUES {values}'''
         self.execute_and_commit(command)
 
+    # not *args because magic method __getitem__ takes only 2 arguments
+    # the rest will be wrapped to tuple automatically
     def __getitem__(self, args):
-        ''' :args - tuple of 2 arguments: key and column (args == (key, column))
-            Returns value stored in column of row where self._primary_key == key 
-            Give only primary_key value or set column = '*' to get the whole row
+        ''' :args - tuple of arguments: key and columns (args == (key, columns))
+            Returns values stored in columns of row where self._primary_key == key 
+            Give only primary_key value or set only one column = '*' to get the whole row
         '''
         if type(args) is not tuple:  # key and to return column are given
             key = args
-            column = '*'
+            columns = '*'
         else:
-            key, *column = args
+            key, *columns = args
 
         if type(key) is str:
             key = "'" + key + "'"
 
         condition = f'''{self._primary_key} = {key}'''
-        command = f'''SELECT {column} FROM {self.name} WHERE '''
+        command = f'''SELECT {columns} FROM {self.name} WHERE '''
         
         # delete all troubling symbols from command
         # these hav occured while formatting values to f-string
@@ -157,9 +159,11 @@ class Table(DatabaseInterface):
         command = command.replace(')', '')
         command = command.replace("'", '')
 
+        # add select condition
         command += condition
 
         data = self.execute_and_fetchone(command)
+
         return data[0] if data and len(data) == 1 else data
     
     def __setitem__(self, args, new_value):
@@ -215,7 +219,9 @@ class Table(DatabaseInterface):
 class Database(DatabaseInterface):
     def __init__(self, filepath):
         super().__init__(filepath)
-        self._tables = {}
+        self._tables: dict = {}
+        # check if in this database already exist tables and if so add them to this dict
+        self.define_existing_tables()
 
     def __getitem__(self, table_name: str) -> Table:
         if self._tables:
@@ -225,6 +231,55 @@ class Database(DatabaseInterface):
     def __setitem__(self, key, value):
         pass
 
+    def find_existing_tables(self):
+        command = '''SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlit_%' '''
+        res = self.execute_and_fetchall(command)    # returns list of tuples each with only one element(name of table)
+                                                    # [('name1',), ('name2',), ('name3',), etc]
+                                                    # but we want only list of names
+        tables = []
+        for table in res:
+            tables.append(table[0])
+        
+        return tables
+    
+    def get_table_columns(self, table_name: str):
+        command = f'''SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}';'''
+        sql_query = self.execute_and_fetchone(command)[0]
+        # sql_query is always like: CREATE TABLE table_name (arg1 type, arg2 type, arg3 type, etc)
+        # we need only part of string, that is in brackets after table_name, but without these brackets
+        columns_str = sql_query.split(table_name)[-1].strip()[1:-1] #[1:-1] to avoid first and last bracket 
+        columns, primary_key = self.__get_column_names(columns_str)
+        return columns, primary_key
+
+    def define_existing_tables(self):
+        existing_tables = self.find_existing_tables()
+        for table in existing_tables:
+            columns, primary_key = self.get_table_columns(table)
+            new_table = Table(self._filepath,
+                              table, columns, primary_key)
+
+            # append table to tables list
+            self._tables[table] = new_table
+
+    @staticmethod
+    def __get_column_names(columns_str):
+        ''' Create tuple with column names from part of SQL-query.
+
+            :columns_str - Part of SQL-command to create new Table, that contains
+             column names with datatype specifications
+        '''
+        columns = []
+        primary_key = ''
+        for column in columns_str.split(','):
+            column = column.strip()
+            if 'primary key' in column or 'PRIMARY KEY' in column:
+                primary_key = column.split()[0]
+
+            if 'autoincrement' not in column and 'AUTOINCREMENT' not in column:
+                columns.append(column.split()[0])
+        columns = tuple(columns)
+        return columns, primary_key
+
     def create_table(self, table_name: str, columns_str: str) -> Table:
         '''  Creates new Table in Database if it not exists.
              It is not the best way to create tables for bot. Better to use
@@ -232,7 +287,7 @@ class Database(DatabaseInterface):
 
             :table_name - Name for new Table
             :columns_str - Part of SQL-command to create new Table, that contains
-             columns names with datatype specifications
+             column names with datatype specifications
 
             - Example to call: 
              database.create_table('New Table', 'arg1 VARCHAR(20) PRIMARY KEY, arg2 INT, arg3 BOOL')
@@ -246,19 +301,8 @@ class Database(DatabaseInterface):
 
             self.execute_and_commit(command)
 
-            columns = []
-            primary_key = ''
-            for column in columns_str.split(','):
-                column = column.strip()
-
-                if 'primary key' in column or 'PRIMARY KEY' in column:
-                    primary_key = column.split()[0]
-                
-                if 'autoincrement' not in column and 'AUTOINCREMENT' not in column:
-                    columns.append(column.split()[0])
-
-            columns = tuple(columns)
-
+            columns, primary_key = self.__get_column_names(columns_str)
+            
             new_table = Table(self._filepath,
                               table_name, columns, primary_key)
 

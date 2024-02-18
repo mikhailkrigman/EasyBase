@@ -85,31 +85,37 @@ class DatabaseInterface:
         return self._cursor.fetchall()
 
     @_on_connection
-    def execute_and_commit(self, command) -> None:
+    def execute_and_commit(self, command) -> bool:
         ''' Execute any SQL query and save changes in database.
             Turns on and off connection automatically
         '''
-        self.execute(command)
-        self.commit()
-        return None
+        if self.execute(command):
+            self.commit()
+            return True
+    
+        return False
 
     @_on_connection
     def execute_and_fetchone(self, command):
         ''' Execute any SQL SELECT-query and return selected data.
             Turns on and off connection automatically
         '''
-        self.execute(command)
-        data = self.fetchone()
-        return data
+        if self.execute(command):
+            data = self.fetchone()
+            return data
+        
+        return None
     
     @_on_connection
     def execute_and_fetchall(self, command):
         ''' Execute any SQL SELECT-query and return selected data.
             Turns on and off connection automatically
         '''
-        self.execute(command)
-        data = self.fetchall()
-        return data
+        if self.execute(command):
+            data = self.fetchall()
+            return data
+        
+        return None
     
 class Table(DatabaseInterface):
     ''' This class represents SQL table and supports usual SQL commands to work with it.
@@ -182,6 +188,12 @@ class Table(DatabaseInterface):
 
         self.execute_and_commit(command)       
 
+    def get_columns(self) -> tuple[str]:
+        return self._columns
+    
+    def get_primary_key(self) -> str:
+        return self._primary_key
+
     def get_by(self, key_property, key_value, column = '*'):
         ''' Returns value stored in column of 
             row where key_property == key_value 
@@ -194,7 +206,7 @@ class Table(DatabaseInterface):
 
         command = f'''SELECT {column} FROM {self.name} WHERE {key_property} = ({key_value})'''
 
-        data = self.execute_and_fetchone(command)
+        data = self.execute_and_fetchall(command)[-1]
         return data if column == '*' or data == None else data[0]
 
     def update_column(self, key_value, update_property, new_value):
@@ -217,68 +229,33 @@ class Table(DatabaseInterface):
 
 
 class Database(DatabaseInterface):
-    def __init__(self, filepath):
+
+    # -------- Constructor, Destructor and overloaded operators ----------------------------------------------------------------------------------------------- #
+
+    def __init__(self, filepath, clear = False):
         super().__init__(filepath)
         self._tables: dict = {}
-        # check if in this database already exist tables and if so add them to this dict
-        self.define_existing_tables()
+        
+        # User has 2 opportunities when creating new database:
+        # 1) Find all already existing tables and work later with them
+        # 2) Create completely new database even if smth already exists there
+        if clear:
+            tables = self.get_existing_tables()
+            for table in tables:
+                self.delete_table(table)
+        else:
+            self._define_existing_tables()
 
     def __getitem__(self, table_name: str) -> Table:
         if self._tables:
-            return self._tables[table_name]
+            return self._tables[table_name] if table_name in self._tables else None
         return None
-        
-    def __setitem__(self, key, value):
-        pass
 
-    def find_existing_tables(self):
-        command = '''SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlit_%' '''
-        res = self.execute_and_fetchall(command)    # returns list of tuples each with only one element(name of table)
-                                                    # [('name1',), ('name2',), ('name3',), etc]
-                                                    # but we want only list of names
-        tables = []
-        for table in res:
-            tables.append(table[0])
-        
-        return tables
-    
-    def get_table_columns(self, table_name: str):
-        command = f'''SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}';'''
-        sql_query = self.execute_and_fetchone(command)[0]
-        # sql_query is always like: CREATE TABLE table_name (arg1 type, arg2 type, arg3 type, etc)
-        # we need only part of string, that is in brackets after table_name, but without these brackets
-        columns_str = sql_query.split(table_name)[-1].strip()[1:-1] #[1:-1] to avoid first and last bracket 
-        columns, primary_key = self.__get_column_names(columns_str)
-        return columns, primary_key
+    def __del__(self):
+        if self.connection():   # error case 
+            self.disconnect()
 
-    def define_existing_tables(self):
-        existing_tables = self.find_existing_tables()
-        for table in existing_tables:
-            columns, primary_key = self.get_table_columns(table)
-            new_table = Table(self._filepath,
-                              table, columns, primary_key)
-
-            # append table to tables list
-            self._tables[table] = new_table
-
-    @staticmethod
-    def __get_column_names(columns_str):
-        ''' Create tuple with column names from part of SQL-query.
-
-            :columns_str - Part of SQL-command to create new Table, that contains
-             column names with datatype specifications
-        '''
-        columns = []
-        primary_key = ''
-        for column in columns_str.split(','):
-            column = column.strip()
-            if 'primary key' in column or 'PRIMARY KEY' in column:
-                primary_key = column.split()[0]
-
-            if 'autoincrement' not in column and 'AUTOINCREMENT' not in column:
-                columns.append(column.split()[0])
-        columns = tuple(columns)
-        return columns, primary_key
+    # -------- PUBLIC METHODS --------------------------------------------------------------------------------------------------------------------------------- #
 
     def create_table(self, table_name: str, columns_str: str) -> Table:
         '''  Creates new Table in Database if it not exists.
@@ -294,14 +271,13 @@ class Database(DatabaseInterface):
         '''
         table_name = table_name.strip()
 
-        if table_name not in self._tables: # If table already exists
+        if table_name not in self._tables: # If table not exists
             columns_str = columns_str.strip()
 
             command = f'''CREATE TABLE IF NOT EXISTS {table_name} ({columns_str})'''
-
             self.execute_and_commit(command)
 
-            columns, primary_key = self.__get_column_names(columns_str)
+            columns, primary_key = self.__get_column_names_from_sql(columns_str)
             
             new_table = Table(self._filepath,
                               table_name, columns, primary_key)
@@ -309,6 +285,48 @@ class Database(DatabaseInterface):
             # append table to tables list
             self._tables[table_name] = new_table
         return self._tables[table_name]
+
+    def get_existing_tables(self):
+        ''' Returns tuple with names of tables, that already exist in the Database '''
+
+        command = '''SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' '''
+        res = self.execute_and_fetchall(command)    # returns list of tuples each with only one element(name of table)
+                                                    # [('name1',), ('name2',), ('name3',), etc]
+                                                    # but we want only list of names
+        tables = []
+        for table in res:
+            tables.append(table[0])
+        
+        return tuple(tables)
+    
+    def get_table_columns(self, table_name: str):
+        ''' Returns tuple with name of columns, that table with table_name has
+            and name of the main column for this table (primary key)
+        '''
+        # if database is already initialised (call from existing object)
+        if table_name in self._tables:
+            table = self[table_name]
+            return table.get_columns(), table.get_primary_key() if table else None, None
+        
+        # if new object is creating we check for existing tables and columns via sql_master
+        else:   
+            command = f'''SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}';'''
+            
+            sql_query = self.execute_and_fetchone(command)
+            if sql_query:
+                sql_query = sql_query[0]    # if fetchone has smth found it returns tuple with only one value == sql
+
+                # sql_query is always looks like: CREATE TABLE table_name (arg1 type, arg2 type, arg3 type, etc)
+                # we need only part of string, that is in brackets after table_name, but without these brackets
+                columns_str = sql_query.split(table_name)[-1].strip()[1:-1] # to avoid first and last bracket
+
+                columns, primary_key = self.__get_column_names_from_sql(columns_str)
+
+            else:
+                columns = None
+                primary_key = None
+
+            return columns, primary_key
 
     def delete_table(self, table_name):
         command = f'''DROP TABLE {table_name};'''
@@ -319,6 +337,38 @@ class Database(DatabaseInterface):
         for table in self._tables:
             self.delete_table(table)
 
-    def __del__(self):
-        if self.connection():   # error case 
-            self.disconnect()
+    # -------- PROTECTED METHODS ------------------------------------------------------------------------------------------------------------------------------ #
+
+    def _define_existing_tables(self):
+        existing_tables = self.get_existing_tables()
+        for table in existing_tables:
+            columns, primary_key = self.get_table_columns(table)
+            new_table = Table(self._filepath,
+                              table, columns, primary_key)
+
+            # append table to tables list
+            self._tables[table] = new_table
+            
+    # -------- PRIVATE METHODS -------------------------------------------------------------------------------------------------------------------------------- #
+        
+    @staticmethod
+    def __get_column_names_from_sql(columns_str):
+        ''' Create tuple with column names from part of SQL-query.
+
+            :columns_str - Part of SQL-command to create new Table, that contains
+             column names with datatype specifications
+
+            :Example of columns_str - 'arg1 VARCHAR(20) PRIMARY KEY, arg2 INT, arg3 BOOL'
+
+        '''
+        columns = []
+        primary_key = ''
+        for column in columns_str.split(','):
+            column = column.strip()
+            if 'primary key' in column or 'PRIMARY KEY' in column:
+                primary_key = column.split()[0]
+
+            if 'autoincrement' not in column and 'AUTOINCREMENT' not in column:
+                columns.append(column.split()[0])
+        columns = tuple(columns)
+        return columns, primary_key
